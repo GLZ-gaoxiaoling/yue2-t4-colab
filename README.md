@@ -140,6 +140,54 @@ T4（16GB，免费档，FP16 + SDPA，`memory_budget_gib=12`, `vae_core_frames=5
 
 对照：社区 PR [#174](https://github.com/multimodal-art-projection/YuE/pull/174) 在 RTX 4050（6GB, sm_89, BF16）上是 178.8s 出 56.7s 音频。T4 慢约 1.5 倍，主要输在没有 FlashAttention。
 
+## 进阶：把任意歌曲改编成交响乐（cover 流程）
+
+官方 cover 路线 = SheetSage2 转谱 → Vocal 旋律搬到 Ins → YuE2 重新配器。
+
+```bash
+# 1) 独立环境装 SheetSage2（Py3.11 + torch 2.8，与 YuE2 的 torch 2.10 隔离）
+colab upload -s ttt ./scripts/10_setup_sheetsage.sh /content/setup_sheetsage.sh
+nohup bash /content/setup_sheetsage.sh > /content/sheetsage_setup.log 2>&1 &
+
+# 2) 原曲转 wav 后转谱（melody-only 会去掉和弦符号）
+ffmpeg -y -i /content/input/source.mp3 -vn -ac 2 -ar 44100 /content/input/source.wav
+cd /content/YuE
+.venv-sheetsage2/bin/python models/SheetSage2/infer.py /content/input/source.wav \
+  --output /content/cover/score --melody-only
+
+# 3) 合并成纯音乐条件（Vocal 音符搬到 Ins），并用官方 abc_tools 校验
+python /content/11_merge_instrumental.py /content/cover/score/score.abc \
+  /content/cover/score/instrumental.abc
+python /content/12_validate_abc.py
+
+# 4) 旋律条件 + 交响风格生成
+python /content/13_generate_cover.py
+
+# 5) 体检（脚本接受任意音频路径）
+python /content/05_analyze.py /content/outputs/symphony/audio.flac
+```
+
+三个必须知道的点：
+
+- **长曲必须关 CFG**：`13_generate_cover.py` 里设了 `cfg_scale=1.0`。默认 CFG 是双分支，KV cache 翻倍，T4 上跑到 1400 tokens 就 `CUDA out of memory`；关掉后显存稳定在 8.8GB，2830 tokens 跑完不炸。
+- **合并要算对八度记号**：`d'16` 是高八度十六分音符，`B,2` 是低八度二分音符。只按 `数字` 算时长会把小节算短，`abc_tools` 立刻报 `duration ... != meter duration`。
+- **官方 `scripts/instrumental.py` 没随 v1.2.0 发布包提供**（SKILL.md 引用了但包里没有），所以本仓库用 `11_merge_instrumental.py` 复刻同样规则：Vocal 全音符搬到 Ins，Vocal 只留休止，同小节两轨都有音时 Vocal 优先。
+
+实测（《天ノ弱》，原曲 110.4s）：
+
+| 项 | 数值 |
+|---|---|
+| 转谱 | SheetSage2 melody-only，B♭ 小调 / 200 BPM / 96 小节 |
+| 输出 | 113.2s，未截断 |
+| 语义 token | 2830，401.5s |
+| 声学合成 | 32 步，233.8s |
+| **全流程** | **648s（约 10.8 分钟）** |
+| 峰值显存 | 11.9GB |
+| 音频体检 | RMS -15.4 dBFS，峰值 -0.14 dBFS，零削波 |
+
+> 转谱误差会原样带进编曲；这类曲谱由 SheetSage2 提供，不是 YuE2 规划出来的。
+
+
 ## 常见问题
 
 | 现象 | 原因 / 处理 |
@@ -148,6 +196,8 @@ T4（16GB，免费档，FP16 + SDPA，`memory_budget_gib=12`, `vae_core_frames=5
 | `RuntimeError: operator torchvision::nms does not exist` | 没卸 torchvision |
 | `FlashAttention only supports Ampere GPUs or newer` | 没打注意力补丁，或装了 `--backend vllm` |
 | `Exit 137` / `Killed` | 系统内存 OOM，必须走分阶段解码 |
+| 长曲跑到一半 `CUDA out of memory` | 默认 CFG 双分支把 KV cache 翻倍，设 `cfg_scale=1.0`；或调小 `vae_core_frames` |
+| `AbcError: duration ... != meter duration` | 合并时没算上 `'` / `,` 八度记号，小节时长算短了 |
 | `Session '<name>' not found` | 那条 assignment 不是 CLI 创建的，接管不了 |
 | 授权后仍要重新登录 | 授权页没勾全 scope，或 tmux 里 CLI 进程退出了（用常驻 bash 的 tmux） |
 
@@ -167,7 +217,11 @@ scripts/
   02_patch_fp16.py       BF16 -> FP16（含 gate 绕过），同时打 site-packages 和源码
   03_patch_attention.py  FlashAttention / cuDNN -> SDPA
   04_generate_staged.py  分阶段生成 + 解码，规避 12GB OOM
-  05_analyze.py          音频客观体检
+  05_analyze.py          音频客观体检（可传任意音频路径）
+  10_setup_sheetsage.sh  独立 venv 安装 SheetSage2 转谱环境
+  11_merge_instrumental.py  Vocal 旋律搬到 Ins，合并成纯音乐谱
+  12_validate_abc.py     用官方 abc_tools 校验合并后的谱
+  13_generate_cover.py   旋律条件 + 交响风格生成（含长曲关 CFG / 分阶段解码）
 sample/
   audio.flac             实测产物（56.84s, 48kHz stereo）
   score.abc              模型生成的 D 大调 / 88 BPM 乐谱
